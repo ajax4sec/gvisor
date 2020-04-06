@@ -838,15 +838,15 @@ func (e *baseEndpoint) SendMsg(ctx context.Context, data [][]byte, c ControlMess
 
 // SetSockOpt sets a socket option. Currently not supported.
 func (e *baseEndpoint) SetSockOpt(opt interface{}) *tcpip.Error {
-	switch v := opt.(type) {
-	case tcpip.PasscredOption:
-		e.setPasscred(v != 0)
-		return nil
-	}
 	return nil
 }
 
 func (e *baseEndpoint) SetSockOptBool(opt tcpip.SockOptBool, v bool) *tcpip.Error {
+	switch opt {
+	case tcpip.PasscredOption:
+		e.setPasscred(v)
+		return nil
+	}
 	return nil
 }
 
@@ -855,6 +855,14 @@ func (e *baseEndpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 }
 
 func (e *baseEndpoint) GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error) {
+	switch opt {
+	case tcpip.KeepaliveEnabledOption:
+		return false, nil
+
+	case tcpip.PasscredOption:
+		return e.Passcred(), nil
+	}
+
 	return false, tcpip.ErrUnknownProtocolOption
 }
 
@@ -920,20 +928,8 @@ func (e *baseEndpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error) {
 
 // GetSockOpt implements tcpip.Endpoint.GetSockOpt.
 func (e *baseEndpoint) GetSockOpt(opt interface{}) *tcpip.Error {
-	switch o := opt.(type) {
+	switch opt.(type) {
 	case tcpip.ErrorOption:
-		return nil
-
-	case *tcpip.PasscredOption:
-		if e.Passcred() {
-			*o = tcpip.PasscredOption(1)
-		} else {
-			*o = tcpip.PasscredOption(0)
-		}
-		return nil
-
-	case *tcpip.KeepaliveEnabledOption:
-		*o = 0
 		return nil
 
 	default:

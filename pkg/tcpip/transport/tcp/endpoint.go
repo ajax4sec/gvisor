@@ -1409,10 +1409,47 @@ func (e *endpoint) windowCrossedACKThresholdLocked(deltaBefore int) (crossed boo
 
 // SetSockOptBool sets a socket option.
 func (e *endpoint) SetSockOptBool(opt tcpip.SockOptBool, v bool) *tcpip.Error {
-	e.LockUser()
-	defer e.UnlockUser()
-
 	switch opt {
+	case tcpip.CorkOption:
+		e.LockUser()
+		if !v {
+			atomic.StoreUint32(&e.cork, 0)
+
+			// Handle the corked data.
+			e.sndWaker.Assert()
+		} else {
+			atomic.StoreUint32(&e.cork, 1)
+		}
+		e.UnlockUser()
+		return nil
+
+	case tcpip.KeepaliveEnabledOption:
+		e.keepalive.Lock()
+		e.keepalive.enabled = v
+		e.keepalive.Unlock()
+		e.notifyProtocolGoroutine(notifyKeepaliveChanged)
+		return nil
+
+	case tcpip.QuickAckOption:
+		o := uint32(1)
+		if v {
+			o = 0
+		}
+		atomic.StoreUint32(&e.slowAck, o)
+		return nil
+
+	case tcpip.ReuseAddressOption:
+		e.LockUser()
+		e.reuseAddr = v
+		e.UnlockUser()
+		return nil
+
+	case tcpip.ReusePortOption:
+		e.LockUser()
+		e.reusePort = v
+		e.UnlockUser()
+		return nil
+
 	case tcpip.V6OnlyOption:
 		// We only recognize this option on v6 endpoints.
 		if e.NetProto != header.IPv6ProtocolNumber {
@@ -1424,7 +1461,9 @@ func (e *endpoint) SetSockOptBool(opt tcpip.SockOptBool, v bool) *tcpip.Error {
 			return tcpip.ErrInvalidEndpointState
 		}
 
+		e.LockUser()
 		e.v6only = v
+		e.UnlockUser()
 	}
 
 	return nil
@@ -1432,7 +1471,55 @@ func (e *endpoint) SetSockOptBool(opt tcpip.SockOptBool, v bool) *tcpip.Error {
 
 // SetSockOptInt sets a socket option.
 func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
+	// Lower 2 bits represents ECN bits. RFC 3168, section 23.1
+	const inetECNMask = 3
+
 	switch opt {
+	case tcpip.DelayOption:
+		if v == 0 {
+			atomic.StoreUint32(&e.delay, 0)
+
+			// Handle delayed data.
+			e.sndWaker.Assert()
+		} else {
+			atomic.StoreUint32(&e.delay, 1)
+		}
+		return nil
+
+	case tcpip.KeepaliveCountOption:
+		e.keepalive.Lock()
+		e.keepalive.count = int(v)
+		e.keepalive.Unlock()
+		e.notifyProtocolGoroutine(notifyKeepaliveChanged)
+		return nil
+
+	case tcpip.IPv4TOSOption:
+		e.LockUser()
+		// TODO(gvisor.dev/issue/995): ECN is not currently supported,
+		// ignore the bits for now.
+		e.sendTOS = uint8(v) & ^uint8(inetECNMask)
+		e.UnlockUser()
+		return nil
+
+	case tcpip.IPv6TrafficClassOption:
+		e.LockUser()
+		// TODO(gvisor.dev/issue/995): ECN is not currently supported,
+		// ignore the bits for now.
+		e.sendTOS = uint8(v) & ^uint8(inetECNMask)
+		e.UnlockUser()
+		return nil
+
+	case tcpip.MaxSegOption:
+		userMSS := v
+		if userMSS < header.TCPMinimumMSS || userMSS > header.TCPMaximumMSS {
+			return tcpip.ErrInvalidOptionValue
+		}
+		e.LockUser()
+		e.userMSS = uint16(userMSS)
+		e.UnlockUser()
+		e.notifyProtocolGoroutine(notifyMSSChanged)
+		return nil
+
 	case tcpip.ReceiveBufferSizeOption:
 		// Make sure the receive buffer size is within the min and max
 		// allowed.
@@ -1504,15 +1591,10 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 		e.sndBufMu.Unlock()
 		return nil
 
-	case tcpip.DelayOption:
-		if v == 0 {
-			atomic.StoreUint32(&e.delay, 0)
-
-			// Handle delayed data.
-			e.sndWaker.Assert()
-		} else {
-			atomic.StoreUint32(&e.delay, 1)
-		}
+	case tcpip.TTLOption:
+		e.LockUser()
+		e.ttl = uint8(v)
+		e.UnlockUser()
 		return nil
 
 	default:
@@ -1522,32 +1604,7 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 
 // SetSockOpt sets a socket option.
 func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
-	// Lower 2 bits represents ECN bits. RFC 3168, section 23.1
-	const inetECNMask = 3
 	switch v := opt.(type) {
-	case tcpip.CorkOption:
-		if v == 0 {
-			atomic.StoreUint32(&e.cork, 0)
-
-			// Handle the corked data.
-			e.sndWaker.Assert()
-		} else {
-			atomic.StoreUint32(&e.cork, 1)
-		}
-		return nil
-
-	case tcpip.ReuseAddressOption:
-		e.LockUser()
-		e.reuseAddr = v != 0
-		e.UnlockUser()
-		return nil
-
-	case tcpip.ReusePortOption:
-		e.LockUser()
-		e.reusePort = v != 0
-		e.UnlockUser()
-		return nil
-
 	case tcpip.BindToDeviceOption:
 		id := tcpip.NICID(v)
 		if id != 0 && !e.stack.HasNIC(id) {
@@ -1556,38 +1613,6 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 		e.LockUser()
 		e.bindToDevice = id
 		e.UnlockUser()
-		return nil
-
-	case tcpip.QuickAckOption:
-		if v == 0 {
-			atomic.StoreUint32(&e.slowAck, 1)
-		} else {
-			atomic.StoreUint32(&e.slowAck, 0)
-		}
-		return nil
-
-	case tcpip.MaxSegOption:
-		userMSS := v
-		if userMSS < header.TCPMinimumMSS || userMSS > header.TCPMaximumMSS {
-			return tcpip.ErrInvalidOptionValue
-		}
-		e.LockUser()
-		e.userMSS = uint16(userMSS)
-		e.UnlockUser()
-		e.notifyProtocolGoroutine(notifyMSSChanged)
-		return nil
-
-	case tcpip.TTLOption:
-		e.LockUser()
-		e.ttl = uint8(v)
-		e.UnlockUser()
-		return nil
-
-	case tcpip.KeepaliveEnabledOption:
-		e.keepalive.Lock()
-		e.keepalive.enabled = v != 0
-		e.keepalive.Unlock()
-		e.notifyProtocolGoroutine(notifyKeepaliveChanged)
 		return nil
 
 	case tcpip.KeepaliveIdleOption:
@@ -1600,13 +1625,6 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 	case tcpip.KeepaliveIntervalOption:
 		e.keepalive.Lock()
 		e.keepalive.interval = time.Duration(v)
-		e.keepalive.Unlock()
-		e.notifyProtocolGoroutine(notifyKeepaliveChanged)
-		return nil
-
-	case tcpip.KeepaliveCountOption:
-		e.keepalive.Lock()
-		e.keepalive.count = int(v)
 		e.keepalive.Unlock()
 		e.notifyProtocolGoroutine(notifyKeepaliveChanged)
 		return nil
@@ -1651,22 +1669,6 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 		// Linux returns ENOENT when an invalid congestion
 		// control algorithm is specified.
 		return tcpip.ErrNoSuchFile
-
-	case tcpip.IPv4TOSOption:
-		e.LockUser()
-		// TODO(gvisor.dev/issue/995): ECN is not currently supported,
-		// ignore the bits for now.
-		e.sendTOS = uint8(v) & ^uint8(inetECNMask)
-		e.UnlockUser()
-		return nil
-
-	case tcpip.IPv6TrafficClassOption:
-		e.LockUser()
-		// TODO(gvisor.dev/issue/995): ECN is not currently supported,
-		// ignore the bits for now.
-		e.sendTOS = uint8(v) & ^uint8(inetECNMask)
-		e.UnlockUser()
-		return nil
 
 	case tcpip.TCPLingerTimeoutOption:
 		e.LockUser()
@@ -1723,6 +1725,38 @@ func (e *endpoint) readyReceiveSize() (int, *tcpip.Error) {
 // GetSockOptBool implements tcpip.Endpoint.GetSockOptBool.
 func (e *endpoint) GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error) {
 	switch opt {
+	case tcpip.CorkOption:
+		o := false
+		if atomic.LoadUint32(&e.cork) != 0 {
+			o = true
+		}
+		return o, nil
+
+	case tcpip.KeepaliveEnabledOption:
+		e.keepalive.Lock()
+		v := e.keepalive.enabled
+		e.keepalive.Unlock()
+
+		return v, nil
+
+	case tcpip.QuickAckOption:
+		v := atomic.LoadUint32(&e.slowAck) == 0
+		return v, nil
+
+	case tcpip.ReuseAddressOption:
+		e.LockUser()
+		v := e.reuseAddr
+		e.UnlockUser()
+
+		return v, nil
+
+	case tcpip.ReusePortOption:
+		e.LockUser()
+		v := e.reusePort
+		e.UnlockUser()
+
+		return v, nil
+
 	case tcpip.V6OnlyOption:
 		// We only recognize this option on v6 endpoints.
 		if e.NetProto != header.IPv6ProtocolNumber {
@@ -1742,6 +1776,39 @@ func (e *endpoint) GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error) {
 // GetSockOptInt implements tcpip.Endpoint.GetSockOptInt.
 func (e *endpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error) {
 	switch opt {
+	case tcpip.DelayOption:
+		var o int
+		if v := atomic.LoadUint32(&e.delay); v != 0 {
+			o = 1
+		}
+		return o, nil
+
+	case tcpip.KeepaliveCountOption:
+		e.keepalive.Lock()
+		v := e.keepalive.count
+		e.keepalive.Unlock()
+		return v, nil
+
+	case tcpip.IPv4TOSOption:
+		e.LockUser()
+		v := int(e.sendTOS)
+		e.UnlockUser()
+		return v, nil
+
+	case tcpip.IPv6TrafficClassOption:
+		e.LockUser()
+		v := int(e.sendTOS)
+		e.UnlockUser()
+		return v, nil
+
+	case tcpip.MaxSegOption:
+		// This is just stubbed out. Linux never returns the user_mss
+		// value as it either returns the defaultMSS or returns the
+		// actual current MSS. Netstack just returns the defaultMSS
+		// always for now.
+		v := header.TCPDefaultMSS
+		return v, nil
+
 	case tcpip.ReceiveQueueSizeOption:
 		return e.readyReceiveSize()
 
@@ -1757,12 +1824,11 @@ func (e *endpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error) {
 		e.rcvListMu.Unlock()
 		return v, nil
 
-	case tcpip.DelayOption:
-		var o int
-		if v := atomic.LoadUint32(&e.delay); v != 0 {
-			o = 1
-		}
-		return o, nil
+	case tcpip.TTLOption:
+		e.LockUser()
+		v := int(e.ttl)
+		e.UnlockUser()
+		return v, nil
 
 	default:
 		return -1, tcpip.ErrUnknownProtocolOption
@@ -1779,59 +1845,9 @@ func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
 		e.lastErrorMu.Unlock()
 		return err
 
-	case *tcpip.MaxSegOption:
-		// This is just stubbed out. Linux never returns the user_mss
-		// value as it either returns the defaultMSS or returns the
-		// actual current MSS. Netstack just returns the defaultMSS
-		// always for now.
-		*o = header.TCPDefaultMSS
-		return nil
-
-	case *tcpip.CorkOption:
-		*o = 0
-		if v := atomic.LoadUint32(&e.cork); v != 0 {
-			*o = 1
-		}
-		return nil
-
-	case *tcpip.ReuseAddressOption:
-		e.LockUser()
-		v := e.reuseAddr
-		e.UnlockUser()
-
-		*o = 0
-		if v {
-			*o = 1
-		}
-		return nil
-
-	case *tcpip.ReusePortOption:
-		e.LockUser()
-		v := e.reusePort
-		e.UnlockUser()
-
-		*o = 0
-		if v {
-			*o = 1
-		}
-		return nil
-
 	case *tcpip.BindToDeviceOption:
 		e.LockUser()
 		*o = tcpip.BindToDeviceOption(e.bindToDevice)
-		e.UnlockUser()
-		return nil
-
-	case *tcpip.QuickAckOption:
-		*o = 1
-		if v := atomic.LoadUint32(&e.slowAck); v != 0 {
-			*o = 0
-		}
-		return nil
-
-	case *tcpip.TTLOption:
-		e.LockUser()
-		*o = tcpip.TTLOption(e.ttl)
 		e.UnlockUser()
 		return nil
 
@@ -1848,17 +1864,6 @@ func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
 		}
 		return nil
 
-	case *tcpip.KeepaliveEnabledOption:
-		e.keepalive.Lock()
-		v := e.keepalive.enabled
-		e.keepalive.Unlock()
-
-		*o = 0
-		if v {
-			*o = 1
-		}
-		return nil
-
 	case *tcpip.KeepaliveIdleOption:
 		e.keepalive.Lock()
 		*o = tcpip.KeepaliveIdleOption(e.keepalive.idle)
@@ -1868,12 +1873,6 @@ func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
 	case *tcpip.KeepaliveIntervalOption:
 		e.keepalive.Lock()
 		*o = tcpip.KeepaliveIntervalOption(e.keepalive.interval)
-		e.keepalive.Unlock()
-		return nil
-
-	case *tcpip.KeepaliveCountOption:
-		e.keepalive.Lock()
-		*o = tcpip.KeepaliveCountOption(e.keepalive.count)
 		e.keepalive.Unlock()
 		return nil
 
@@ -1902,18 +1901,6 @@ func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
 	case *tcpip.CongestionControlOption:
 		e.LockUser()
 		*o = e.cc
-		e.UnlockUser()
-		return nil
-
-	case *tcpip.IPv4TOSOption:
-		e.LockUser()
-		*o = tcpip.IPv4TOSOption(e.sendTOS)
-		e.UnlockUser()
-		return nil
-
-	case *tcpip.IPv6TrafficClassOption:
-		e.LockUser()
-		*o = tcpip.IPv6TrafficClassOption(e.sendTOS)
 		e.UnlockUser()
 		return nil
 

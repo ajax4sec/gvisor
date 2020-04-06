@@ -533,12 +533,8 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 
 // GetSockOpt implements tcpip.Endpoint.GetSockOpt.
 func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
-	switch o := opt.(type) {
+	switch opt.(type) {
 	case tcpip.ErrorOption:
-		return nil
-
-	case *tcpip.KeepaliveEnabledOption:
-		*o = 0
 		return nil
 
 	default:
@@ -548,6 +544,11 @@ func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
 
 // GetSockOptBool implements tcpip.Endpoint.GetSockOptBool.
 func (e *endpoint) GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error) {
+	switch opt {
+	case tcpip.KeepaliveEnabledOption:
+		return false, nil
+	}
+
 	return false, tcpip.ErrUnknownProtocolOption
 }
 
